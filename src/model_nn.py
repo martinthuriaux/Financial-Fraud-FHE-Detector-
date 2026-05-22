@@ -10,8 +10,8 @@ Dependency: preprocessing.py must have run first to produce the .npy splits.
 Usage
 -----
     python model_nn.py                        # default settings
-    python model_nn.py --n_bits 8            # higher quantisation precision
-    python model_nn.py --skip_smote          # skip SMOTE oversampling
+    python model_nn.py --n_w_bits 6 --n_a_bits 6  # quantisation precision (max ~6 for FHE)
+    python model_nn.py --smote               # enable SMOTE oversampling
     python model_nn.py --skip_compile        # train only, no FHE compile
 """
 
@@ -19,10 +19,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import pickle
 import time
 from pathlib import Path
 
+import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -118,7 +118,7 @@ def compute_class_weights(y_train: np.ndarray) -> torch.Tensor:
 
     Even after SMOTE (which balances the dataset numerically), we keep a
     weighted loss as a second safeguard.  If SMOTE is skipped via
-    --skip_smote the weights become the primary mechanism for handling
+    Without --smote the weights become the primary mechanism for handling
     class imbalance.
 
     Weight formula:  w_i = total_samples / (n_classes * count_i)
@@ -150,7 +150,7 @@ def build_model(
     lr:            float = 1e-3,
     weight_decay:  float = 1e-4,
     patience:      int   = 10,
-    prune_rate:    float = 0.0,
+    prune_rate:    float = 0.1,
 ) -> NeuralNetClassifier:
 
     callbacks = [
@@ -267,7 +267,16 @@ def evaluate_fhe(
     very slow — each forward pass can take several seconds.
     """
     print(f"\n--- FHE simulation ({n_samples} samples) ---")
-    idx   = np.random.default_rng(42).choice(len(X_test), n_samples, replace=False)
+    rng       = np.random.default_rng(42)
+    fraud_idx = np.where(y_test == 1)[0]
+    legit_idx = np.where(y_test == 0)[0]
+    n_fraud   = min(len(fraud_idx), n_samples // 2)
+    n_legit   = n_samples - n_fraud
+    idx = np.concatenate([
+        rng.choice(fraud_idx, n_fraud, replace=False),
+        rng.choice(legit_idx, n_legit, replace=False),
+    ])
+    rng.shuffle(idx)
     X_sub = X_test[idx]
     y_sub = y_test[idx]
 
@@ -305,25 +314,29 @@ def compile_to_fhe(model: NeuralNetClassifier, X_train: np.ndarray):
 
 def save_artifacts(
     model:        NeuralNetClassifier,
-    fhe_circuit,
     params:       dict,
     metrics:      dict,
     artifacts_dir: Path,
 ) -> None:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(artifacts_dir / "model.pkl", "wb") as f:
-        pickle.dump(model, f)
+    # FHE circuit serialization via FHEModelDev triggers a libc++ crash on macOS
+    # (concrete-python LLVM bug). The circuit is compiled at server startup instead
+    # — compile once, serve forever — so no disk serialization is needed here.
 
-    circuit_dir = artifacts_dir / "fhe_circuit"
-    circuit_dir.mkdir(exist_ok=True)
-    fhe_circuit.save_to_dir(str(circuit_dir))
+    # PyTorch weights for fast plaintext inference without recompiling.
+    joblib.dump(model.module_.state_dict(), artifacts_dir / "model_weights.joblib")
+
+    with open(artifacts_dir / "threshold.json", "w") as f:
+        json.dump({"threshold": float(metrics.get("best_threshold", 0.5))}, f)
 
     with open(artifacts_dir / "params.json", "w") as f:
         json.dump(params, f, indent=2)
 
+    metrics_to_save = {k: float(v) for k, v in metrics.items()
+                       if k != "best_threshold"}
     with open(artifacts_dir / "metrics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(metrics_to_save, f, indent=2)
 
     print(f"\nArtefacts saved to {artifacts_dir}")
 
@@ -338,11 +351,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_a_bits",       type=int,   default=6)
     p.add_argument("--max_epochs",    type=int,   default=100)
     p.add_argument("--batch_size",    type=int,   default=256)
-    p.add_argument("--lr",            type=float, default=1e-3)
+    p.add_argument("--lr",            type=float, default=3e-4)
     p.add_argument("--weight_decay",  type=float, default=1e-4)
     p.add_argument("--prune_rate",     type=float, default=0.0)
     p.add_argument("--patience",      type=int,   default=20)
-    p.add_argument("--skip_smote",    action="store_true")
+    p.add_argument("--smote",         action="store_true")
     p.add_argument("--skip_compile",  action="store_true")
     p.add_argument("--data_dir",      type=Path,  default=DATA_DIR)
     p.add_argument("--artifacts_dir", type=Path,  default=ARTIFACTS_DIR)
@@ -355,8 +368,8 @@ def main() -> None:
     # 1. Load data
     X_train, X_test, y_train, y_test = load_splits(args.data_dir)
 
-    # 2. Oversample minority class in training set
-    if not args.skip_smote:
+    # 2. Oversample minority class in training set (opt-in)
+    if args.smote:
         X_train, y_train = apply_smote(X_train, y_train)
 
     # 3. Class weights from post-SMOTE labels — always applied.
@@ -394,7 +407,7 @@ def main() -> None:
         return
 
     # 7. Compile → evaluate under FHE simulation → save
-    fhe_circuit = compile_to_fhe(model, X_train)
+    compile_to_fhe(model, X_train)
     fhe_metrics = evaluate_fhe(model, X_test, y_test)
 
     delta = abs(pt_metrics["roc_auc"] - fhe_metrics["roc_auc_fhe"])
@@ -402,7 +415,7 @@ def main() -> None:
     if delta > 0.02:
         print("  Warning: delta > 0.02 — consider increasing n_bits.")
 
-    save_artifacts(model, fhe_circuit, params, {**pt_metrics, **fhe_metrics},
+    save_artifacts(model, params, {**pt_metrics, **fhe_metrics},
                    args.artifacts_dir)
 
 

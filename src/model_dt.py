@@ -16,7 +16,7 @@ Dependency: preprocessing.py must have run first.
 Usage
 -----
     python model_dt.py                        # default settings
-    python model_dt.py --max_depth 5          # specific tree depth
+    python model_dt.py --max_depth 6          # specific tree depth
     python model_dt.py --depth_sweep          # compare depths 3-8
     python model_dt.py --skip_compile         # train + evaluate only
 """
@@ -25,9 +25,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import pickle
 import time
 from pathlib import Path
+
+import joblib
 
 import numpy as np
 from sklearn.metrics import (
@@ -174,7 +175,7 @@ def train(
 FEATURE_NAMES = ["Time"] + [f"V{i}" for i in range(1, 29)] + ["Amount"]
 
 
-def print_tree(model: DecisionTreeClassifier, max_depth: int = 3) -> None:
+def print_tree(model: DecisionTreeClassifier, max_depth: int =6) -> None:
     """
     Print a human-readable version of the decision tree.
 
@@ -193,7 +194,7 @@ def print_tree(model: DecisionTreeClassifier, max_depth: int = 3) -> None:
         |--- V14 > -2.50
         |   |--- class: 0  (legit)
     """
-    if max_depth > 5:
+    if max_depth > 6:
         print("\n(Tree too deep to print readably — skipping)")
         return
 
@@ -341,8 +342,16 @@ def evaluate_fhe(
     n_samples: int = 100,
 ) -> dict:
     print(f"\n--- FHE simulation ({n_samples} samples) ---")
-    idx   = np.random.default_rng(42).choice(len(X_test), n_samples,
-                                              replace=False)
+    rng       = np.random.default_rng(42)
+    fraud_idx = np.where(y_test == 1)[0]
+    legit_idx = np.where(y_test == 0)[0]
+    n_fraud   = min(len(fraud_idx), n_samples // 2)
+    n_legit   = n_samples - n_fraud
+    idx = np.concatenate([
+        rng.choice(fraud_idx, n_fraud, replace=False),
+        rng.choice(legit_idx, n_legit, replace=False),
+    ])
+    rng.shuffle(idx)
     X_sub = X_test[idx]
     y_sub = y_test[idx]
 
@@ -367,19 +376,18 @@ def evaluate_fhe(
 
 def save_artifacts(
     model:         DecisionTreeClassifier,
-    fhe_circuit,
     params:        dict,
     metrics:       dict,
     artifacts_dir: Path,
 ) -> None:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(artifacts_dir / "model.pkl", "wb") as f:
-        pickle.dump(model, f)
+    # FHE circuit serialization via FHEModelDev triggers a libc++ crash on macOS
+    # (concrete-python LLVM bug). The circuit is compiled at server startup instead
+    # — compile once, serve forever — so no disk serialization is needed here.
 
-    circuit_dir = artifacts_dir / "fhe_circuit"
-    circuit_dir.mkdir(exist_ok=True)
-    fhe_circuit.save_to_dir(str(circuit_dir))
+    # Plaintext sklearn model for fast non-encrypted inference.
+    joblib.dump(model.sklearn_model, artifacts_dir / "sklearn_model.joblib")
 
     with open(artifacts_dir / "threshold.json", "w") as f:
         json.dump({"threshold": metrics.get("best_threshold", 0.5)}, f)
@@ -446,7 +454,7 @@ def main() -> None:
         print("\nSkipping FHE compilation (--skip_compile set).")
         return
 
-    fhe_circuit = compile_to_fhe(model, X_train)
+    compile_to_fhe(model, X_train)
     fhe_metrics = evaluate_fhe(model, X_test, y_test)
 
     delta = abs(pt_metrics["roc_auc"] - fhe_metrics["roc_auc_fhe"])
@@ -455,7 +463,7 @@ def main() -> None:
         print("  Warning: delta > 0.02 - consider increasing n_bits.")
 
     all_metrics = {**pt_metrics, **fhe_metrics}
-    save_artifacts(model, fhe_circuit, params, all_metrics, args.artifacts_dir)
+    save_artifacts(model, params, all_metrics, args.artifacts_dir)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ Usage
 -----
     python model_xgboost.py                   # default settings
     python model_xgboost.py --sweep           # compare n_bits 4-8, no compile
-    python model_xgboost.py --n_bits 6        # specific bit width
+    python model_xgboost.py --n_bits 8        # specific bit width
     python model_xgboost.py --skip_compile    # train + evaluate, no FHE compile
 """
 
@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import pickle
 import time
 from pathlib import Path
+
+import joblib
 
 import numpy as np
 from sklearn.metrics import (
@@ -121,7 +122,7 @@ def build_model(
     --------------------
     n_bits : int
         Lower = faster FHE circuit but potential accuracy loss.
-        6 is a good starting point.  Use --sweep to find the best value
+        8 is a good starting point.  Use --sweep to find the best value
         before committing to a full FHE compile.
 
     n_estimators : int
@@ -321,8 +322,16 @@ def evaluate_fhe(
     Delta > 0.02 on ROC-AUC suggests quantisation loss - increase n_bits.
     """
     print(f"\n--- FHE simulation ({n_samples} samples) ---")
-    idx   = np.random.default_rng(42).choice(len(X_test), n_samples,
-                                              replace=False)
+    rng       = np.random.default_rng(42)
+    fraud_idx = np.where(y_test == 1)[0]
+    legit_idx = np.where(y_test == 0)[0]
+    n_fraud   = min(len(fraud_idx), n_samples // 2)
+    n_legit   = n_samples - n_fraud
+    idx = np.concatenate([
+        rng.choice(fraud_idx, n_fraud, replace=False),
+        rng.choice(legit_idx, n_legit, replace=False),
+    ])
+    rng.shuffle(idx)
     X_sub = X_test[idx]
     y_sub = y_test[idx]
 
@@ -347,19 +356,18 @@ def evaluate_fhe(
 
 def save_artifacts(
     model:         XGBClassifier,
-    fhe_circuit,
     params:        dict,
     metrics:       dict,
     artifacts_dir: Path,
 ) -> None:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(artifacts_dir / "model.pkl", "wb") as f:
-        pickle.dump(model, f)
+    # FHE circuit serialization via FHEModelDev triggers a libc++ crash on macOS
+    # (concrete-python LLVM bug). The circuit is compiled at server startup instead
+    # — compile once, serve forever — so no disk serialization is needed here.
 
-    circuit_dir = artifacts_dir / "fhe_circuit"
-    circuit_dir.mkdir(exist_ok=True)
-    fhe_circuit.save_to_dir(str(circuit_dir))
+    # Plaintext sklearn/XGBoost model for fast non-encrypted inference.
+    joblib.dump(model.sklearn_model, artifacts_dir / "sklearn_model.joblib")
 
     with open(artifacts_dir / "threshold.json", "w") as f:
         json.dump({"threshold": metrics.get("best_threshold", 0.5)}, f)
@@ -385,7 +393,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Train and compile XGBoost FHE fraud detector"
     )
-    p.add_argument("--n_bits",                type=int,   default=6)
+    p.add_argument("--n_bits",                type=int,   default=10)
     p.add_argument("--n_estimators",          type=int,   default=200)
     p.add_argument("--max_depth",             type=int,   default=5)
     p.add_argument("--learning_rate",         type=float, default=0.05)
@@ -429,7 +437,7 @@ def main() -> None:
         print("\nSkipping FHE compilation (--skip_compile set).")
         return
 
-    fhe_circuit = compile_to_fhe(model, X_train)
+    compile_to_fhe(model, X_train)
     fhe_metrics = evaluate_fhe(model, X_test, y_test)
 
     delta = abs(pt_metrics["roc_auc"] - fhe_metrics["roc_auc_fhe"])
@@ -438,7 +446,7 @@ def main() -> None:
         print("  Warning: delta > 0.02 - consider increasing n_bits.")
 
     all_metrics = {**pt_metrics, **fhe_metrics}
-    save_artifacts(model, fhe_circuit, params, all_metrics, args.artifacts_dir)
+    save_artifacts(model, params, all_metrics, args.artifacts_dir)
 
 
 if __name__ == "__main__":
