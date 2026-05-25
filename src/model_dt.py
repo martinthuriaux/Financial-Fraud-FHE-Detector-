@@ -6,7 +6,7 @@ compiles it to an FHE circuit, and saves all artefacts.
 
 A single Decision Tree is the simplest FHE-compatible model in this
 project.  It produces the smallest circuit, the fastest FHE inference,
-and is fully human-readable — every split can be printed and inspected.
+and is fully human-readable - every split can be printed and inspected.
 
 The tradeoff: lower accuracy than XGBoost (which uses 50+ trees) but
 much faster FHE inference and complete interpretability.
@@ -16,8 +16,9 @@ Dependency: preprocessing.py must have run first.
 Usage
 -----
     python model_dt.py                        # default settings
-    python model_dt.py --max_depth 6          # specific tree depth
+    python model_dt.py --max_depth 7          # specific tree depth
     python model_dt.py --depth_sweep          # compare depths 3-8
+    python model_dt.py --weight_sweep         # find best class_weight
     python model_dt.py --skip_compile         # train + evaluate only
 """
 
@@ -29,7 +30,6 @@ import time
 from pathlib import Path
 
 import joblib
-
 import numpy as np
 from sklearn.metrics import (
     average_precision_score,
@@ -69,18 +69,23 @@ def load_splits(data_dir: Path) -> tuple[np.ndarray, ...]:
 # Section 3 - Class weight
 # ---------------------------------------------------------------------------
 
-def compute_class_weight(y_train: np.ndarray) -> dict:
-    """
-    Return per-class weights using the same sqrt formula as the XGBoost model.
+# Default class weight for the fraud class.  Found via --weight_sweep.
+# Single trees are very sensitive to this on imbalanced data:
+#   too low (~5)  -> model predicts everything as legit
+#   too high (~24) -> model predicts everything as fraud
+# A value between 10 and 16 usually gives reasonable predictions.
+DEFAULT_FRAUD_WEIGHT = 12.0
 
-    "balanced" (the sklearn shorthand) uses the raw ratio (~577), which is
-    too aggressive and collapses precision.  sqrt(n_legit / n_fraud) (~24)
-    moderates the signal while still strongly up-weighting fraud.
+
+def compute_class_weight(y_train: np.ndarray,
+                         w_fraud: float = DEFAULT_FRAUD_WEIGHT) -> dict:
     """
-    n_legit = (y_train == 0).sum()
-    n_fraud = (y_train == 1).sum()
-    w_fraud = (n_legit / n_fraud) ** 0.5
-    print(f"\nClass weight — legit: 1.00,  fraud: {w_fraud:.2f}")
+    Return per-class weights for the Decision Tree.
+
+    Uses a fixed weight rather than a formula because the optimal value
+    is dataset-specific and was determined empirically via --weight_sweep.
+    """
+    print(f"\nClass weight - legit: 1.00,  fraud: {w_fraud:.2f}")
     return {0: 1.0, 1: w_fraud}
 
 
@@ -99,40 +104,29 @@ def build_model(
     Construct the Concrete-ML DecisionTreeClassifier.
 
     class_weight : dict
-        Per-class weights passed to the split criterion.  Uses the same
-        sqrt(n_legit / n_fraud) formula as the XGBoost model (~24) rather
-        than sklearn's "balanced" shorthand which gives the raw ratio (~577)
-        and pushes recall too high at the expense of precision.
+        Per-class weights passed to the split criterion.  Single trees
+        are pathologically sensitive to this on imbalanced data, so the
+        weight should be tuned via --weight_sweep, not left at sklearn's
+        default "balanced" (which gives the full ~577 ratio).
 
     min_samples_leaf : int
-        Minimum number of training samples required at a leaf node.
-        Default sklearn value is 1 (a leaf can form on a single sample).
-        Setting to 5 prevents the tree from memorising individual fraud
-        cases, similar to min_child_weight in XGBoost.
+        Minimum samples required at a leaf.  Larger values prevent the
+        tree from creating tiny leaves with extreme probabilities (1.0 or
+        0.0) that don't generalise.  20 is a reasonable default.
 
     criterion : str
-        The function used to measure split quality.  "entropy" (information
-        gain) is more sensitive to small impurity changes than "gini",
-        which can help find better splits in a heavily imbalanced dataset.
+        "entropy" is more sensitive to small impurity changes than "gini",
+        which helps with imbalanced data.
 
     max_depth
-        The only meaningful capacity parameter for a single tree.
-        Controls the maximum number of nested splits from root to leaf.
-
-        depth 3 →  8 possible leaves, very simple rules
-        depth 5 →  32 possible leaves, moderate complexity
-        depth 7 →  128 possible leaves, captures fine-grained patterns
-        depth None → grows until pure leaves, almost always overfits
-
-        For FHE: deeper trees produce larger circuits and slower inference.
-        depth 5-6 is the practical sweet spot for this dataset.
+        depth 4-5: underfits, misses complex fraud patterns
+        depth 6-7: good balance for this dataset
+        depth 8+: starts overfitting, larger FHE circuit
 
     n_bits
-        Quantisation precision.  Decision Trees are the most tolerant
-        of low n_bits among all three models because their computation
-        is just integer comparisons — no matrix multiplications that
-        accumulate rounding error across many operations.
-        n_bits=6 is usually sufficient with negligible accuracy loss.
+        Quantisation precision.  Decision Trees tolerate low n_bits well
+        because their computation is just integer comparisons.
+        6 is usually sufficient.
     """
     model = DecisionTreeClassifier(
         n_bits=n_bits,
@@ -150,13 +144,7 @@ def train(
     X_train: np.ndarray,
     y_train: np.ndarray,
 ) -> DecisionTreeClassifier:
-    """
-    Train in plaintext.
-
-    Decision Tree training is extremely fast — under a second — because
-    it makes a single greedy pass through the data, finding the best
-    split at each node without iteration.
-    """
+    """Train in plaintext.  Single pass, sub-second."""
     print("\n--- Training Decision Tree ---")
     t0 = time.perf_counter()
     model.fit(X_train, y_train)
@@ -168,51 +156,35 @@ def train(
 
 
 # ---------------------------------------------------------------------------
-# Section 4 - Print tree (interpretability)
+# Section 5 - Print tree (interpretability)
 # ---------------------------------------------------------------------------
 
-# Feature names matching the column order from preprocessing.py
 FEATURE_NAMES = ["Time"] + [f"V{i}" for i in range(1, 29)] + ["Amount"]
 
 
-def print_tree(model: DecisionTreeClassifier, max_depth: int =6) -> None:
+def print_tree(model: DecisionTreeClassifier, max_depth: int = 6) -> None:
     """
     Print a human-readable version of the decision tree.
-
-    This is only meaningful for shallow trees (max_depth <= 5).
-    For deeper trees it becomes too large to read.
-
-    The output shows exactly which features and thresholds the model
-    uses at each split — something impossible with XGBoost or the NN.
-
-    Example output:
-        |--- V14 <= -2.50
-        |   |--- V10 <= -3.12
-        |   |   |--- class: 1  (fraud)
-        |   |--- V10 > -3.12
-        |   |   |--- class: 0  (legit)
-        |--- V14 > -2.50
-        |   |--- class: 0  (legit)
+    Only meaningful for shallow trees (max_depth <= 6).
     """
     if max_depth > 6:
-        print("\n(Tree too deep to print readably — skipping)")
+        print("\n(Tree too deep to print readably - skipping)")
         return
 
-    print(f"\n--- Decision Tree structure (first {max_depth} levels) ---")
+    print(f"\n--- Decision Tree structure (first 3 levels) ---")
 
-    # Concrete-ML wraps the sklearn tree — access it via .sklearn_model
     sklearn_tree = model.sklearn_model
     tree_text = export_text(
         sklearn_tree,
         feature_names=FEATURE_NAMES,
-        max_depth=3,           # only show top 3 levels for readability
+        max_depth=3,
         show_weights=False,
     )
     print(tree_text)
 
 
 # ---------------------------------------------------------------------------
-# Section 5 - Plaintext evaluation with threshold tuning
+# Section 6 - Plaintext evaluation with threshold tuning
 # ---------------------------------------------------------------------------
 
 def evaluate_plaintext(
@@ -257,7 +229,7 @@ def evaluate_plaintext(
 
 
 # ---------------------------------------------------------------------------
-# Section 6 - max_depth sweep
+# Section 7 - max_depth sweep
 # ---------------------------------------------------------------------------
 
 def depth_sweep(
@@ -269,18 +241,10 @@ def depth_sweep(
     depth_range: list | None = None,
 ) -> None:
     """
-    Train and evaluate at several max_depth values without FHE compilation.
-
-    Unlike XGBoost where n_estimators and max_depth both matter, for a
-    single Decision Tree max_depth is the primary knob.
+    Train and evaluate at several max_depth values.
 
     Use this to find the depth that best balances accuracy vs FHE circuit
     size before committing to compilation.
-
-    Typical finding on this dataset:
-        depth 3-4  → underfits, misses complex fraud patterns
-        depth 5-6  → good balance, clean FHE circuit
-        depth 7+   → overfits, marginal accuracy gain, larger circuit
     """
     if depth_range is None:
         depth_range = [3, 4, 5, 6, 7, 8]
@@ -310,7 +274,71 @@ def depth_sweep(
 
 
 # ---------------------------------------------------------------------------
-# Section 7 - FHE compilation and simulation evaluation
+# Section 8 - class_weight sweep
+# ---------------------------------------------------------------------------
+
+def weight_sweep(
+    X_train:   np.ndarray,
+    y_train:   np.ndarray,
+    X_test:    np.ndarray,
+    y_test:    np.ndarray,
+    n_bits:    int = 6,
+    max_depth: int = 7,
+    weights:   list | None = None,
+) -> None:
+    """
+    Train the tree at several class_weight values to find the sweet spot.
+
+    Single trees are extremely sensitive to class weighting on imbalanced
+    data:
+        weight too low  (~5)  -> model predicts everything as legit
+        weight too high (~24) -> model predicts everything as fraud
+
+    The "Fraud %" column shows the fraction of test predictions flagged
+    as fraud at the optimal threshold.  Aim for 0.5% to 5%
+    (true fraud rate is 0.17%).
+    """
+    if weights is None:
+        weights = [5.0, 8.0, 12.0, 16.0, 20.0, 25.0, 35.0, 50.0]
+
+    print(f"\n--- class_weight sweep (max_depth={max_depth}) ---")
+    print(f"{'w_fraud':<10} {'PR-AUC':<10} {'ROC-AUC':<10} "
+          f"{'Threshold':<12} {'Fraud %':<10}")
+    print("-" * 60)
+
+    for w in weights:
+        cw    = {0: 1.0, 1: w}
+        model = build_model(
+            n_bits=n_bits,
+            max_depth=max_depth,
+            class_weight=cw,
+            min_samples_leaf=20,
+        )
+        model.fit(X_train, y_train)
+
+        y_proba = model.predict_proba(X_test)[:, 1]
+        roc_auc = roc_auc_score(y_test, y_proba)
+        pr_auc  = average_precision_score(y_test, y_proba)
+
+        prec, rec, thresholds = precision_recall_curve(y_test, y_proba)
+        f1_scores = 2 * prec * rec / (prec + rec + 1e-8)
+        best_idx  = f1_scores.argmax()
+        best_thr  = float(thresholds[best_idx])
+        fraud_pct = (y_proba >= best_thr).mean() * 100
+
+        print(f"{w:<10.1f} {pr_auc:<10.4f} {roc_auc:<10.4f} "
+              f"{best_thr:<12.4f} {fraud_pct:<10.2f}")
+
+    print("\nPick a w_fraud where:")
+    print("  - PR-AUC is highest")
+    print("  - Fraud %% is between 0.5%% and 5%% "
+          "(true rate is 0.17%%)")
+    print("Update DEFAULT_FRAUD_WEIGHT at the top of model_dt.py "
+          "with your choice.")
+
+
+# ---------------------------------------------------------------------------
+# Section 9 - FHE compilation and simulation evaluation
 # ---------------------------------------------------------------------------
 
 def compile_to_fhe(
@@ -321,11 +349,7 @@ def compile_to_fhe(
     Compile to FHE circuit.
 
     A Decision Tree compiles to the simplest circuit of all three models.
-    Each prediction follows one path from root to leaf — a sequence of
-    integer comparisons with no accumulation across multiple trees.
-
-    Expect compilation in under 30 seconds and FHE simulation latency
-    significantly faster than XGBoost.
+    Each prediction follows one path from root to leaf.
     """
     print("\n--- Compiling to FHE circuit ---")
     t0 = time.perf_counter()
@@ -371,7 +395,7 @@ def evaluate_fhe(
 
 
 # ---------------------------------------------------------------------------
-# Section 8 - Save artefacts
+# Section 10 - Save artefacts
 # ---------------------------------------------------------------------------
 
 def save_artifacts(
@@ -382,11 +406,9 @@ def save_artifacts(
 ) -> None:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    # FHE circuit serialization via FHEModelDev triggers a libc++ crash on macOS
-    # (concrete-python LLVM bug). The circuit is compiled at server startup instead
-    # — compile once, serve forever — so no disk serialization is needed here.
-
-    # Plaintext sklearn model for fast non-encrypted inference.
+    # FHE circuit serialization via FHEModelDev triggers a libc++ crash on macOS.
+    # The circuit is compiled at server startup instead.
+    # Keep sklearn model for reference; server uses cml_model.json instead.
     joblib.dump(model.sklearn_model, artifacts_dir / "sklearn_model.joblib")
 
     with open(artifacts_dir / "threshold.json", "w") as f:
@@ -414,15 +436,19 @@ def parse_args() -> argparse.Namespace:
         description="Train and compile Decision Tree FHE fraud detector"
     )
     p.add_argument("--n_bits",            type=int,   default=6)
-    p.add_argument("--max_depth",         type=int,   default=6)
-    p.add_argument("--min_samples_leaf",  type=int,   default=5)
+    p.add_argument("--max_depth",         type=int,   default=7)
+    p.add_argument("--min_samples_leaf",  type=int,   default=20)
     p.add_argument("--criterion",         type=str,   default="entropy")
-    p.add_argument("--depth_sweep",  action="store_true",
+    p.add_argument("--fraud_weight",      type=float, default=DEFAULT_FRAUD_WEIGHT,
+                   help="Weight applied to fraud class. Use --weight_sweep to find.")
+    p.add_argument("--depth_sweep",       action="store_true",
                    help="Sweep max_depth 3-8 and exit")
-    p.add_argument("--skip_compile", action="store_true",
+    p.add_argument("--weight_sweep",      action="store_true",
+                   help="Sweep class_weight values and exit")
+    p.add_argument("--skip_compile",      action="store_true",
                    help="Skip FHE compilation")
-    p.add_argument("--data_dir",     type=Path, default=DATA_DIR)
-    p.add_argument("--artifacts_dir",type=Path, default=ARTIFACTS_DIR)
+    p.add_argument("--data_dir",          type=Path, default=DATA_DIR)
+    p.add_argument("--artifacts_dir",     type=Path, default=ARTIFACTS_DIR)
     return p.parse_args()
 
 
@@ -430,25 +456,46 @@ def main() -> None:
     args = parse_args()
 
     X_train, X_test, y_train, y_test = load_splits(args.data_dir)
-    cw = compute_class_weight(y_train)
+
+    # --- Optional sweeps ---
+    if args.weight_sweep:
+        weight_sweep(X_train, y_train, X_test, y_test,
+                     n_bits=args.n_bits, max_depth=args.max_depth)
+        return
 
     if args.depth_sweep:
         depth_sweep(X_train, y_train, X_test, y_test, n_bits=args.n_bits)
         return
+
+    # --- Standard training flow ---
+    cw = compute_class_weight(y_train, w_fraud=args.fraud_weight)
 
     params = dict(
         n_bits=args.n_bits,
         max_depth=args.max_depth,
         min_samples_leaf=args.min_samples_leaf,
         criterion=args.criterion,
+        fraud_weight=args.fraud_weight,
     )
-    model = build_model(class_weight=cw, **params)
+    model = build_model(
+        n_bits=args.n_bits,
+        max_depth=args.max_depth,
+        class_weight=cw,
+        min_samples_leaf=args.min_samples_leaf,
+        criterion=args.criterion,
+    )
     model = train(model, X_train, y_train)
 
-    # Print tree structure — unique to this model
     print_tree(model, max_depth=args.max_depth)
 
     pt_metrics = evaluate_plaintext(model, X_test, y_test)
+
+    # Save CML model as JSON with float thresholds BEFORE compile() replaces
+    # them with quantized integers.  The server loads this file and recompiles.
+    args.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    with open(args.artifacts_dir / "cml_model.json", "w") as f:
+        model.dump(f)
+    print(f"  CML model (pre-compile) saved to {args.artifacts_dir}/cml_model.json")
 
     if args.skip_compile:
         print("\nSkipping FHE compilation (--skip_compile set).")

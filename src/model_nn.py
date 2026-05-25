@@ -22,7 +22,6 @@ import json
 import time
 from pathlib import Path
 
-import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -324,8 +323,31 @@ def save_artifacts(
     # (concrete-python LLVM bug). The circuit is compiled at server startup instead
     # — compile once, serve forever — so no disk serialization is needed here.
 
-    # PyTorch weights for fast plaintext inference without recompiling.
-    joblib.dump(model.module_.state_dict(), artifacts_dir / "model_weights.joblib")
+    # Use CML's own JSON serializer instead of joblib/pickle.
+    # The model's PyTorch/Brevitas layers are not picklable (dynamically-injected
+    # Brevitas classes have no stable module path). CML's dump() avoids this by
+    # serializing weights via torch.save to a BytesIO buffer (hex-encoded in JSON)
+    # and handles quantizers/ONNX via a custom ConcreteEncoder.
+    # server.py recompiles the FHE circuit at startup, so we clear it first.
+    # CML's serializer refuses to dump trained callback objects (EarlyStopping,
+    # LRScheduler, etc.) and the compiled FHE circuit (ctypes pointers). Both are
+    # irrelevant after training: callbacks are training-only, and server.py
+    # recompiles the circuit at startup.
+    qm = getattr(model, 'quantized_module_', None)
+    if qm is not None and hasattr(qm, 'fhe_circuit'):
+        qm.fhe_circuit = None
+
+    # CML's deserializer reconstructs CrossEntropyLoss() with no arguments, so
+    # it has no 'weight' buffer.  Loading a state dict that contains 'weight'
+    # into that bare criterion raises RuntimeError.  Strip it here — the class
+    # weight is only used during training, not inference.
+    crit = getattr(getattr(model, 'sklearn_model', None), 'criterion_', None)
+    if crit is not None and 'weight' in crit._buffers:
+        del crit._buffers['weight']
+
+    model.callbacks = "disable"
+    with open(artifacts_dir / "cml_model.json", "w") as f:
+        model.dump(f)
 
     with open(artifacts_dir / "threshold.json", "w") as f:
         json.dump({"threshold": float(metrics.get("best_threshold", 0.5))}, f)

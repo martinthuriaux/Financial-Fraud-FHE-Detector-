@@ -366,7 +366,9 @@ def save_artifacts(
     # (concrete-python LLVM bug). The circuit is compiled at server startup instead
     # — compile once, serve forever — so no disk serialization is needed here.
 
-    # Plaintext sklearn/XGBoost model for fast non-encrypted inference.
+    # Keep sklearn model for reference/diagnostics.
+    # NOTE: by this point compile() has already quantized the thresholds to integers.
+    # The server uses cml_model.json (saved before compile) for correct inference.
     joblib.dump(model.sklearn_model, artifacts_dir / "sklearn_model.joblib")
 
     with open(artifacts_dir / "threshold.json", "w") as f:
@@ -432,6 +434,13 @@ def main() -> None:
     model = train(model, X_train, y_train)
 
     pt_metrics = evaluate_plaintext(model, X_test, y_test)
+
+    # Save CML model as JSON with float thresholds BEFORE compile() replaces
+    # them with quantized integers.  The server loads this file and recompiles.
+    args.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    with open(args.artifacts_dir / "cml_model.json", "w") as f:
+        model.dump(f)
+    print(f"  CML model (pre-compile) saved to {args.artifacts_dir}/cml_model.json")
 
     if args.skip_compile:
         print("\nSkipping FHE compilation (--skip_compile set).")
